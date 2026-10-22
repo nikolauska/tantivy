@@ -144,6 +144,8 @@ pub struct PluginMergeContext<'a> {
     pub schema: &'a Schema,
     /// Settings of the target index.
     pub settings: &'a IndexSettings,
+    /// Threads the plugin may start for this merge, besides the calling one.
+    pub num_threads: usize,
 }
 
 #[cfg(test)]

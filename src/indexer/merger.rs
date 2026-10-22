@@ -57,6 +57,7 @@ pub struct IndexMerger {
     pub(crate) readers: Vec<SegmentReader>,
     max_doc: u32,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
+    num_threads: usize,
 }
 
 impl IndexMerger {
@@ -172,7 +173,14 @@ impl IndexMerger {
             readers,
             max_doc,
             custom_plugins,
+            num_threads: 1,
         })
+    }
+
+    /// Sets how many threads [`Self::write`] may use. See
+    /// [`crate::IndexWriterOptions`]'s `num_threads_per_merge`.
+    pub(crate) fn set_num_threads(&mut self, num_threads: usize) {
+        self.num_threads = num_threads.max(1);
     }
 
     /// The custom (non-built-in) plugins of the segments being merged.
@@ -533,6 +541,7 @@ impl IndexMerger {
                 target_segment,
                 schema: &self.schema,
                 settings: &self.index_settings,
+                num_threads: self.num_threads,
             })?;
         }
 

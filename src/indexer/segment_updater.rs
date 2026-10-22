@@ -86,6 +86,7 @@ fn merge(
     index: &Index,
     mut segment_entries: Vec<SegmentEntry>,
     target_opstamp: Opstamp,
+    num_threads: usize,
 ) -> crate::Result<Option<SegmentEntry>> {
     let num_docs = segment_entries
         .iter()
@@ -112,8 +113,9 @@ fn merge(
         .collect();
 
     // An IndexMerger is like a "view" of our merged segments.
-    let merger: IndexMerger =
+    let mut merger: IndexMerger =
         IndexMerger::open(index.schema(), index.settings().clone(), &segments[..])?;
+    merger.set_num_threads(num_threads);
 
     // ... we just serialize this index merger in our new segment to merge the segments.
     let num_docs = merger.write(&merged_segment)?;
@@ -282,6 +284,7 @@ pub(crate) struct InnerSegmentUpdater {
     active_index_meta: RwLock<Arc<IndexMeta>>,
     pool: ThreadPool,
     merge_thread_pool: ThreadPool,
+    num_threads_per_merge: usize,
 
     index: Index,
     segment_manager: SegmentManager,
@@ -297,6 +300,7 @@ impl SegmentUpdater {
         stamper: Stamper,
         delete_cursor: &DeleteCursor,
         num_merge_threads: usize,
+        num_threads_per_merge: usize,
     ) -> crate::Result<SegmentUpdater> {
         let segments = index.searchable_segment_metas()?;
         let segment_manager = SegmentManager::from_segments(segments, delete_cursor);
@@ -332,6 +336,7 @@ impl SegmentUpdater {
             active_index_meta: RwLock::new(Arc::new(index_meta)),
             pool,
             merge_thread_pool,
+            num_threads_per_merge,
             index,
             segment_manager,
             merge_policy: RwLock::new(Arc::new(DefaultMergePolicy::default())),
@@ -548,6 +553,7 @@ impl SegmentUpdater {
                     &segment_updater.index,
                     segment_entries,
                     merge_operation.target_opstamp(),
+                    segment_updater.num_threads_per_merge,
                 )
             }));
             let merge_res = match merge_panic_res {

@@ -60,6 +60,14 @@ pub struct IndexWriterOptions {
     #[builder(default = 4)]
     /// Defines the number of merger threads to use.
     num_merge_threads: usize,
+    #[builder(default = 1)]
+    /// The number of threads a single merge uses to encode postings, besides
+    /// the merger thread that runs it.
+    ///
+    /// Only fields without positions use them, in merges that keep every
+    /// document in segment order: no deletes, and no reordering for index
+    /// sorting.
+    num_threads_per_merge: usize,
 }
 
 /// `IndexWriter` is the user entry-point to add document to an index.
@@ -315,6 +323,7 @@ impl<D: Document> IndexWriter<D> {
             stamper.clone(),
             &delete_queue.cursor(),
             options.num_merge_threads,
+            options.num_threads_per_merge,
         )?;
 
         let mut index_writer = Self {

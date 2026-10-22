@@ -243,6 +243,33 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
         Ok(())
     }
 
+    /// A postings serializer configured like this field's, so other threads
+    /// can encode terms for [`Self::write_encoded_term`].
+    pub(crate) fn detached_postings_serializer(&self) -> PostingsSerializer {
+        let ps = &self.postings_serializer;
+        PostingsSerializer::new(ps.avg_fieldnorm, ps.mode, ps.fieldnorm_reader.clone())
+    }
+
+    /// Adds a term whose postings were already encoded by a
+    /// [`Self::detached_postings_serializer`]. Only for fields without
+    /// positions, whose offsets the encoded bytes can't carry.
+    pub(crate) fn write_encoded_term(
+        &mut self,
+        term: &[u8],
+        doc_freq: u32,
+        postings: &[u8],
+    ) -> io::Result<()> {
+        assert!(!self.term_open && self.positions_serializer_opt.is_none());
+        let start = self.postings_offset();
+        self.postings_write.write_all(postings)?;
+        self.term_dictionary_builder.insert_key(term)?;
+        self.term_dictionary_builder.insert_value(&TermInfo {
+            doc_freq,
+            postings_range: start..self.postings_offset(),
+            positions_range: 0..0,
+        })
+    }
+
     /// Closes the current field.
     pub fn close(mut self) -> io::Result<()> {
         self.close_term()?;
@@ -479,7 +506,7 @@ impl PostingsSerializer {
         Ok(())
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.block.clear();
         self.last_doc_id_encoded = 0;
     }

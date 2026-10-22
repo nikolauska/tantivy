@@ -17,21 +17,22 @@ use measure_time::debug_time;
 use tokenizer_api::BoxTokenStream;
 
 use crate::directory::{CompositeFile, Directory};
-use crate::docset::DocSet;
+use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsSerializer, FieldNormsWriter};
 use crate::index::{Segment, SegmentComponent, SegmentReader};
-use crate::indexer::doc_id_mapping::{DocIdMapping, SegmentDocIdMapping};
+use crate::indexer::doc_id_mapping::{DocIdMapping, MappingType, SegmentDocIdMapping};
 use crate::indexer::indexing_term::IndexingTerm;
 use crate::json_utils::{index_json_value, IndexingPositionsPerPath};
 use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
 use crate::postings::{
     compute_table_memory_size, serialize_postings, IndexingContext, IndexingPosition,
-    InvertedIndexSerializer, PerFieldPostingsWriter, Postings, PostingsMerger, PostingsWriter,
-    SegmentPostings,
+    FieldSerializer, InvertedIndexSerializer, PerFieldPostingsWriter, Postings, PostingsMerger,
+    PostingsWriter, SegmentPostings,
 };
 use crate::schema::document::{Document, Value};
-use crate::schema::{Field, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
+use crate::postings::serializer::PostingsSerializer;
+use crate::schema::{Field, FieldType, IndexRecordOption, Schema, DATE_TIME_PRECISION_INDEXED};
 use crate::space_usage::{ComponentSpaceUsage, FIELDNORMS, POSITIONS, POSTINGS, TERMDICT};
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
@@ -86,6 +87,7 @@ impl SegmentPlugin for InvertedIndexPlugin {
             &mut serializer,
             fieldnorm_readers,
             ctx.doc_id_mapping,
+            ctx.num_threads,
         )?;
         serializer.close()?;
         Ok(())
@@ -549,6 +551,7 @@ fn write_postings_for_field(
     serializer: &mut InvertedIndexSerializer,
     fieldnorm_reader: Option<FieldNormReader>,
     doc_id_mapping: &SegmentDocIdMapping,
+    num_threads: usize,
 ) -> crate::Result<()> {
     debug_time!("write-postings-for-field");
     let mut positions_buffer: Vec<u32> = Vec::with_capacity(1_000);
@@ -594,6 +597,35 @@ fn write_postings_for_field(
         "Encountered a field that is not supposed to be
                      indexed. Have you modified the schema?",
     );
+
+    let stacked_doc_offsets: Option<Vec<DocId>> =
+        (doc_id_mapping.mapping_type() == MappingType::Stacked).then(|| {
+            readers
+                .iter()
+                .scan(0, |offset, reader| {
+                    let start = *offset;
+                    *offset += reader.max_doc();
+                    Some(start)
+                })
+                .collect()
+        });
+
+    if let Some(doc_offsets) = &stacked_doc_offsets {
+        if !segment_postings_option.has_positions() {
+            if let Some(ranges) = parallel_term_ranges(&field_readers, num_threads)? {
+                write_postings_in_parallel(
+                    num_threads,
+                    &field_readers,
+                    segment_postings_option,
+                    doc_offsets,
+                    &ranges,
+                    &mut field_serializer,
+                )?;
+                field_serializer.close()?;
+                return Ok(());
+            }
+        }
+    }
 
     let mut segment_postings_containing_the_term: Vec<(usize, SegmentPostings)> = vec![];
     let mut merger = PostingsMerger::new(&merged_doc_id_map);
@@ -646,7 +678,25 @@ fn write_postings_for_field(
 
         field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
 
-        if doc_id_mapping.is_trivial() {
+        if let Some(doc_offsets) = &stacked_doc_offsets {
+            // Without deletes a segment's docs keep their order and only
+            // shift, so adding its offset spares a lookup per posting.
+            for (segment_ord, mut postings) in segment_postings_containing_the_term.drain(..) {
+                let offset = doc_offsets[segment_ord];
+                while postings.doc() != TERMINATED {
+                    let term_freq = if has_term_freq {
+                        postings.positions(&mut positions_buffer);
+                        postings.term_freq()
+                    } else {
+                        positions_buffer.clear();
+                        0
+                    };
+                    let delta_positions = delta_computer.compute_delta(&positions_buffer);
+                    field_serializer.write_doc(postings.doc() + offset, term_freq, delta_positions);
+                    postings.advance();
+                }
+            }
+        } else if doc_id_mapping.is_trivial() {
             for (segment_ord, mut postings) in segment_postings_containing_the_term.drain(..) {
                 let mapping = &merged_doc_id_map[segment_ord];
                 while let Some(doc) = crate::postings::next_mapped_doc(&mut postings, mapping) {
@@ -682,12 +732,222 @@ fn write_postings_for_field(
     Ok(())
 }
 
+/// Terms per range in a parallel merge: big enough that a range outweighs
+/// handing it between threads, small enough that a few ranges in flight per
+/// thread stay a small part of the field. Tests use small ranges so that
+/// small indexes split into many.
+const TERMS_PER_RANGE: usize = if cfg!(test) { 64 } else { 4096 };
+
+/// A term range `[start, end)`; `None` means unbounded.
+type TermRange = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// Splits a field's terms into ranges of about [`TERMS_PER_RANGE`] terms
+/// each, using the segment with the most terms as the sample. `None` when the
+/// field is too small, or threads too few, for splitting to pay off.
+fn parallel_term_ranges(
+    field_readers: &[Arc<InvertedIndexReader>],
+    num_threads: usize,
+) -> crate::Result<Option<Vec<TermRange>>> {
+    if num_threads < 2 {
+        return Ok(None);
+    }
+    let Some(biggest) = field_readers.iter().map(|r| r.terms()).max_by_key(|t| t.num_terms())
+    else {
+        return Ok(None);
+    };
+    let num_terms = biggest.num_terms();
+    let num_ranges = num_terms / TERMS_PER_RANGE;
+    if num_ranges < 2 {
+        return Ok(None);
+    }
+    let mut bounds = Vec::with_capacity(num_ranges - 1);
+    for i in 1..num_ranges {
+        let mut key = Vec::new();
+        biggest.ord_to_term((i * num_terms / num_ranges) as TermOrdinal, &mut key)?;
+        bounds.push(key);
+    }
+    let starts: Vec<_> = std::iter::once(None).chain(bounds.iter().cloned().map(Some)).collect();
+    let ends = bounds.into_iter().map(Some).chain(std::iter::once(None));
+    Ok(Some(starts.into_iter().zip(ends).collect()))
+}
+
+/// The terms of one range with their postings encoded, ready to be written in
+/// order by [`FieldSerializer::write_encoded_term`].
+#[derive(Default)]
+struct EncodedTerms {
+    keys: Vec<u8>,
+    /// For each term: where its key ends in `keys`, its doc freq, and where
+    /// its postings end in `postings`.
+    terms: Vec<(usize, u32, usize)>,
+    postings: Vec<u8>,
+}
+
+fn encode_term_range(
+    field_readers: &[Arc<InvertedIndexReader>],
+    record_option: IndexRecordOption,
+    doc_offsets: &[DocId],
+    (start, end): &TermRange,
+    postings_serializer: &mut PostingsSerializer,
+) -> crate::Result<EncodedTerms> {
+    let mut streams = Vec::with_capacity(field_readers.len());
+    for reader in field_readers {
+        let mut builder = reader.terms().range();
+        if let Some(start) = start {
+            builder = builder.ge(start);
+        }
+        if let Some(end) = end {
+            builder = builder.lt(end);
+        }
+        streams.push(builder.into_stream()?);
+    }
+    let mut merged_terms = TermMerger::new(streams);
+    let mut out = EncodedTerms::default();
+    let mut segment_postings: Vec<(usize, SegmentPostings)> = Vec::new();
+    while merged_terms.advance() {
+        segment_postings.clear();
+        let mut total_doc_freq = 0;
+        for (segment_ord, term_info) in merged_terms.current_segment_ords_and_term_infos() {
+            let postings = field_readers[segment_ord]
+                .read_postings_from_terminfo(&term_info, record_option)?;
+            // Stacked merges have no deletes, so every posting is alive.
+            let doc_freq = postings.doc_freq();
+            if doc_freq > 0 {
+                total_doc_freq += doc_freq;
+                segment_postings.push((segment_ord, postings));
+            }
+        }
+        if total_doc_freq == 0 {
+            continue;
+        }
+        let has_term_freq = !segment_postings[0].1.block_cursor.freqs().is_empty();
+        if segment_postings[1..]
+            .iter()
+            .any(|(_, p)| has_term_freq == p.block_cursor.freqs().is_empty())
+        {
+            return Err(
+                DataCorruption::comment_only("Term freqs are inconsistent across segments").into(),
+            );
+        }
+        postings_serializer.clear();
+        postings_serializer.new_term(total_doc_freq, has_term_freq);
+        let mut written = 0;
+        for (segment_ord, mut postings) in segment_postings.drain(..) {
+            let offset = doc_offsets[segment_ord];
+            while postings.doc() != TERMINATED {
+                let term_freq = if has_term_freq { postings.term_freq() } else { 0 };
+                postings_serializer.write_doc(postings.doc() + offset, term_freq);
+                written += 1;
+                postings.advance();
+            }
+        }
+        postings_serializer.close_term(written, &mut out.postings)?;
+        out.keys.extend_from_slice(merged_terms.key());
+        out.terms.push((out.keys.len(), written, out.postings.len()));
+    }
+    Ok(out)
+}
+
+/// Encodes the ranges' postings on several threads and writes them in order.
+/// Only a few ranges per thread are in flight, so memory stays bounded
+/// however big the field is; the term dictionary is still built on this
+/// thread, since it must see terms in order.
+fn write_postings_in_parallel(
+    num_threads: usize,
+    field_readers: &[Arc<InvertedIndexReader>],
+    record_option: IndexRecordOption,
+    doc_offsets: &[DocId],
+    ranges: &[TermRange],
+    field_serializer: &mut FieldSerializer,
+) -> crate::Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{mpsc, Condvar, Mutex};
+
+    let threads = num_threads.min(ranges.len());
+    let window = threads * 4;
+    let next = AtomicUsize::new(0);
+    let written = Mutex::new(0usize);
+    let progressed = Condvar::new();
+    let abort = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel::<(usize, crate::Result<EncodedTerms>)>();
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let tx = tx.clone();
+            let mut postings_serializer = field_serializer.detached_postings_serializer();
+            let (next, written, progressed, abort) = (&next, &written, &progressed, &abort);
+            scope.spawn(move || loop {
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                if idx >= ranges.len() {
+                    return;
+                }
+                {
+                    let mut done = written.lock().unwrap();
+                    while idx >= *done + window && !abort.load(Ordering::Relaxed) {
+                        done = progressed.wait(done).unwrap();
+                    }
+                }
+                if abort.load(Ordering::Relaxed) {
+                    return;
+                }
+                let encoded = encode_term_range(
+                    field_readers,
+                    record_option,
+                    doc_offsets,
+                    &ranges[idx],
+                    &mut postings_serializer,
+                );
+                if tx.send((idx, encoded)).is_err() {
+                    return;
+                }
+            });
+        }
+        drop(tx);
+
+        let result = (|| -> crate::Result<()> {
+            let mut pending = BTreeMap::new();
+            for idx in 0..ranges.len() {
+                let encoded = loop {
+                    if let Some(encoded) = pending.remove(&idx) {
+                        break encoded;
+                    }
+                    let (i, encoded) = rx.recv().map_err(|_| {
+                        TantivyError::InternalError("postings merge thread died".to_string())
+                    })?;
+                    pending.insert(i, encoded);
+                };
+                let encoded: EncodedTerms = encoded?;
+                let (mut key_start, mut postings_start) = (0, 0);
+                for &(key_end, doc_freq, postings_end) in &encoded.terms {
+                    field_serializer.write_encoded_term(
+                        &encoded.keys[key_start..key_end],
+                        doc_freq,
+                        &encoded.postings[postings_start..postings_end],
+                    )?;
+                    (key_start, postings_start) = (key_end, postings_end);
+                }
+                *written.lock().unwrap() = idx + 1;
+                progressed.notify_all();
+            }
+            Ok(())
+        })();
+        // Wakes workers waiting for room, so a failed merge doesn't hang.
+        abort.store(true, Ordering::Relaxed);
+        {
+            let _guard = written.lock().unwrap();
+            progressed.notify_all();
+        }
+        drop(rx);
+        result
+    })
+}
+
 fn write_postings_merge(
     readers: &[SegmentReader],
     schema: &Schema,
     serializer: &mut InvertedIndexSerializer,
     fieldnorm_readers: FieldNormReaders,
     doc_id_mapping: &SegmentDocIdMapping,
+    num_threads: usize,
 ) -> crate::Result<()> {
     for (field, field_entry) in schema.fields() {
         let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
@@ -699,6 +959,7 @@ fn write_postings_merge(
                 serializer,
                 fieldnorm_reader,
                 doc_id_mapping,
+                num_threads,
             )?;
         }
     }
@@ -707,6 +968,144 @@ fn write_postings_merge(
 
 #[cfg(test)]
 mod tests {
+    // The parallel merge tests need files on disk to copy.
+    #[cfg(feature = "mmap")]
+    mod parallel_postings_merge {
+        use std::path::Path;
+
+        use tempfile::TempDir;
+
+        use crate::index::SegmentComponent;
+        use crate::indexer::{IndexWriterOptions, NoMergePolicy};
+        use crate::schema::{
+            IndexRecordOption, Schema, TextFieldIndexing, TextOptions, INDEXED, STRING,
+        };
+        use crate::{Index, IndexWriter};
+
+        /// Four segments built from a fixed word sequence.
+        fn index_with_segments(dir: &Path) -> Index {
+            let mut schema = Schema::builder();
+            let text = |option| {
+                TextOptions::default().set_indexing_options(
+                    TextFieldIndexing::default()
+                        .set_tokenizer("whitespace")
+                        .set_index_option(option),
+                )
+            };
+            let freqs = schema.add_text_field("freqs", text(IndexRecordOption::WithFreqs));
+            let basic = schema.add_text_field("basic", text(IndexRecordOption::Basic));
+            let positions =
+                schema.add_text_field("positions", text(IndexRecordOption::WithFreqsAndPositions));
+            let tag = schema.add_text_field("tag", STRING);
+            let num = schema.add_u64_field("num", INDEXED);
+            let index = Index::create_in_dir(dir, schema.build()).unwrap();
+            let mut writer: IndexWriter = index.writer_for_tests().unwrap();
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            let mut seed = 7u64;
+            let mut next = move || {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                seed >> 33
+            };
+            for doc in 0..6_000u64 {
+                // Squaring skews the words, so a few have postings long enough
+                // for skip data and most only a document or two.
+                let words: Vec<String> = (0..1 + next() % 8)
+                    .map(|_| {
+                        let r = next() % 3_000;
+                        format!("w{}", r * r / 3_000)
+                    })
+                    .collect();
+                let words = words.join(" ");
+                writer
+                    .add_document(doc!(
+                        freqs => words.clone(),
+                        basic => words.clone(),
+                        positions => words,
+                        tag => format!("t{}", doc % 7),
+                        num => next() % 2_000,
+                    ))
+                    .unwrap();
+                if doc % 1_500 == 1_499 {
+                    writer.commit().unwrap();
+                }
+            }
+            writer.commit().unwrap();
+            index
+        }
+
+        /// Merges a copy of the segments in `source`. A copy, not a rebuild:
+        /// segment ids are random and set the order segments are merged in.
+        fn merged_files(
+            source: &Path,
+            num_threads_per_merge: usize,
+        ) -> Vec<(SegmentComponent, Vec<u8>)> {
+            let copy = TempDir::new().unwrap();
+            for entry in std::fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                std::fs::copy(entry.path(), copy.path().join(entry.file_name())).unwrap();
+            }
+            let index = Index::open_in_dir(copy.path()).unwrap();
+            let mut writer: IndexWriter = index
+                .writer_with_options(
+                    IndexWriterOptions::builder()
+                        .memory_budget_per_thread(15_000_000)
+                        .num_threads_per_merge(num_threads_per_merge)
+                        .build(),
+                )
+                .unwrap();
+            let segment_ids = index.searchable_segment_ids().unwrap();
+            assert_eq!(segment_ids.len(), 4);
+            let merged = writer.merge(&segment_ids).wait().unwrap().unwrap();
+            let segment = index.segment(merged);
+            [
+                SegmentComponent::Terms,
+                SegmentComponent::Postings,
+                SegmentComponent::Positions,
+                SegmentComponent::FieldNorms,
+                SegmentComponent::FastFields,
+                SegmentComponent::Store,
+            ]
+            .into_iter()
+            .map(|component| {
+                let bytes = segment.open_read(component.clone()).unwrap();
+                (component, bytes.read_bytes().unwrap().as_slice().to_vec())
+            })
+            .collect()
+        }
+
+        #[test]
+        fn test_parallel_postings_merge_splits_into_many_ranges() {
+            let dir = TempDir::new().unwrap();
+            let index = index_with_segments(dir.path());
+            let searcher = index.reader().unwrap().searcher();
+            let field = index.schema().get_field("freqs").unwrap();
+            let field_readers: Vec<_> = searcher
+                .segment_readers()
+                .iter()
+                .map(|reader| reader.inverted_index(field).unwrap())
+                .collect();
+            let ranges = super::super::parallel_term_ranges(&field_readers, 3).unwrap().unwrap();
+            // More ranges than may be in flight, so writers wait for room too.
+            assert!(ranges.len() > 3 * 4, "only {} ranges", ranges.len());
+            assert!(super::super::parallel_term_ranges(&field_readers, 1).unwrap().is_none());
+        }
+
+        #[test]
+        fn test_parallel_postings_merge_writes_same_bytes() {
+            let source = TempDir::new().unwrap();
+            index_with_segments(source.path());
+            let sequential = merged_files(source.path(), 1);
+            for num_threads in [2, 3, 8] {
+                let parallel = merged_files(source.path(), num_threads);
+                for ((component, expected), (_, actual)) in sequential.iter().zip(&parallel) {
+                    assert!(
+                        expected == actual,
+                        "{component:?} differs with {num_threads} threads"
+                    );
+                }
+            }
+        }
+    }
 
     #[cfg(not(feature = "compare_hash_only"))]
     #[test]
